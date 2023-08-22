@@ -173,8 +173,13 @@ final class UTMAppleVirtualMachine: UTMVirtualMachine {
         }
         state = .starting
         do {
+            let isSuspended = await registryEntry.isSuspended
             try await beginAccessingResources()
-            try await _start(options: options)
+            if isSuspended && !options.contains(.bootRecovery) {
+                try await restoreSnapshot()
+            } else {
+                try await _start(options: options)
+            }
             if #available(macOS 12, *) {
                 Task { @MainActor in
                     sharedDirectoriesChanged = config.sharedDirectoriesPublisher.sink { [weak self] newShares in
@@ -328,16 +333,95 @@ final class UTMAppleVirtualMachine: UTMVirtualMachine {
         }
     }
     
+    @available(macOS 14, *)
+    private func _saveSnapshot(url: URL) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            vmQueue.async {
+                guard let apple = self.apple else {
+                    continuation.resume(throwing: UTMAppleVirtualMachineError.operationNotAvailable)
+                    return
+                }
+                apple.saveMachineStateTo(url: url) { error in
+                    if let error = error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+        }
+    }
+    
     func saveSnapshot(name: String? = nil) async throws {
-        // FIXME: implement this
+        guard #available(macOS 14, *) else {
+            return
+        }
+        guard let vmSavedStateURL = await config.system.boot.vmSavedStateURL else {
+            return
+        }
+        if state == .started {
+            try await pause()
+        }
+        guard state == .paused else {
+            return
+        }
+        state = .saving
+        defer {
+            state = .paused
+        }
+        try await _saveSnapshot(url: vmSavedStateURL)
+        await registryEntry.setIsSuspended(true)
     }
     
     func deleteSnapshot(name: String? = nil) async throws {
-        // FIXME: implement this
+        guard let vmSavedStateURL = await config.system.boot.vmSavedStateURL else {
+            return
+        }
+        try FileManager.default.removeItem(at: vmSavedStateURL)
+        await registryEntry.setIsSuspended(false)
+    }
+    
+    @available(macOS 14, *)
+    private func _restoreSnapshot(url: URL) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            vmQueue.async {
+                guard let apple = self.apple else {
+                    continuation.resume(throwing: UTMAppleVirtualMachineError.operationNotAvailable)
+                    return
+                }
+                apple.restoreMachineStateFrom(url: url) { error in
+                    if let error = error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+        }
     }
     
     func restoreSnapshot(name: String? = nil) async throws {
-        // FIXME: implement this
+        guard #available(macOS 14, *) else {
+            throw UTMAppleVirtualMachineError.operationNotAvailable
+        }
+        guard let vmSavedStateURL = await config.system.boot.vmSavedStateURL else {
+            throw UTMAppleVirtualMachineError.operationNotAvailable
+        }
+        if state == .started {
+            try await stop(usingMethod: .force)
+        }
+        guard state == .stopped || state == .starting else {
+            throw UTMAppleVirtualMachineError.operationNotAvailable
+        }
+        state = .restoring
+        do {
+            try await _restoreSnapshot(url: vmSavedStateURL)
+        } catch {
+            state = .stopped
+            throw error
+        }
+        state = .started
+        try await deleteSnapshot(name: name)
     }
     
     private func _resume() async throws {
